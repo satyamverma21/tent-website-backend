@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "cleanup:amenities": "node scripts/cleanup-amenities.js",
+    "cleanup:amenities": "node scripts/cleanup-amenities.js"
   },
   "keywords": [
     "express",
