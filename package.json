@@ -1,0 +1,36 @@
+{
+  "name": "tent-hotel-backend",
+  "version": "1.0.0",
+  "description": "Hotel Room & Tent Booking backend (Express + SQLite + UPI Deep Links + PDFKit)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "cleanup:amenities": "node scripts/cleanup-amenities.js",
+  },
+  "keywords": [
+    "express",
+    "sqlite",
+    "upi",
+    "pdfkit",
+    "hotel-booking",
+    "tents",
+    "rooms"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pdfkit": "^0.15.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
