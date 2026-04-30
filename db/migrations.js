@@ -50,6 +50,7 @@ function runMigrations() {
       type TEXT NOT NULL,
       description TEXT,
       capacity INTEGER DEFAULT 2,
+      quantity INTEGER NOT NULL DEFAULT 1,
       basePrice REAL NOT NULL,
       registrationAmount REAL NOT NULL DEFAULT 0,
       arrivalAmount REAL NOT NULL DEFAULT 0,
@@ -85,6 +86,30 @@ function runMigrations() {
       status TEXT DEFAULT 'pending',
       payment_status TEXT DEFAULT 'unpaid',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS room_manual_bookings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      check_in DATE NOT NULL,
+      check_out DATE NOT NULL,
+      booked_quantity INTEGER NOT NULL DEFAULT 1,
+      notes TEXT,
+      created_by_user_id INTEGER REFERENCES users(id),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(room_id, check_in, check_out)
+    );
+
+    CREATE TABLE IF NOT EXISTS tent_manual_bookings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tent_id INTEGER NOT NULL REFERENCES tents(id) ON DELETE CASCADE,
+      check_in DATE NOT NULL,
+      check_out DATE NOT NULL,
+      booked_quantity INTEGER NOT NULL DEFAULT 1,
+      notes TEXT,
+      created_by_user_id INTEGER REFERENCES users(id),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(tent_id, check_in, check_out)
     );
 
     CREATE TABLE IF NOT EXISTS payments (
@@ -216,15 +241,20 @@ function runMigrations() {
   if (!tentHasTotalPrice) {
     db.exec('ALTER TABLE tents ADD COLUMN totalPrice REAL NOT NULL DEFAULT 0;');
   }
+  const tentHasQuantity = tentColumns.some((col) => col.name === 'quantity');
+  if (!tentHasQuantity) {
+    db.exec('ALTER TABLE tents ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1;');
+  }
   db.exec(
     `UPDATE tents
      SET registrationAmount = CASE WHEN registrationAmount > 0 THEN registrationAmount ELSE basePrice END,
-         arrivalAmount = CASE WHEN arrivalAmount > 0 THEN arrivalAmount ELSE 0 END,
-         totalPrice = CASE
-           WHEN totalPrice > 0 THEN totalPrice
-           ELSE (CASE WHEN registrationAmount > 0 THEN registrationAmount ELSE basePrice END)
-              + (CASE WHEN arrivalAmount > 0 THEN arrivalAmount ELSE 0 END)
-         END`
+          arrivalAmount = CASE WHEN arrivalAmount > 0 THEN arrivalAmount ELSE 0 END,
+          quantity = CASE WHEN IFNULL(quantity, 0) > 0 THEN quantity ELSE 1 END,
+          totalPrice = CASE
+            WHEN totalPrice > 0 THEN totalPrice
+            ELSE (CASE WHEN registrationAmount > 0 THEN registrationAmount ELSE basePrice END)
+               + (CASE WHEN arrivalAmount > 0 THEN arrivalAmount ELSE 0 END)
+          END`
   );
 
   // Add promo_code_id column to bookings table if it doesn't exist yet
@@ -253,7 +283,16 @@ function runMigrations() {
          arrival_amount = CASE
            WHEN arrival_amount >= 0 THEN arrival_amount
            ELSE 0
-         END`
+          END`
+  );
+
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_room_manual_bookings_room_dates
+     ON room_manual_bookings (room_id, check_in, check_out);`
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_tent_manual_bookings_tent_dates
+     ON tent_manual_bookings (tent_id, check_in, check_out);`
   );
 
   seedInitialData(db);

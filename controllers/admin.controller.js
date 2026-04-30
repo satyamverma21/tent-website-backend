@@ -23,6 +23,73 @@ function isValidDateString(value) {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
+function assignRoomUnitLabels(entries, roomQuantity) {
+  const maxUnits = Math.max(Number(roomQuantity || 1), 1);
+  const sorted = [...entries].sort((a, b) => {
+    const aKey = `${a.check_in}|${a.check_out}|${a.created_at || ''}|${a.booking_ref || ''}`;
+    const bKey = `${b.check_in}|${b.check_out}|${b.created_at || ''}|${b.booking_ref || ''}`;
+    return aKey.localeCompare(bKey);
+  });
+
+  const slotEnds = Array.from({ length: maxUnits }, () => '');
+  sorted.forEach((entry) => {
+    const requiredUnitsRaw =
+      entry.source_type === 'manual'
+        ? Number(entry.manual_booked_quantity || 0)
+        : Number(entry.status === 'cancelled' ? 0 : 1);
+    const requiredUnits = Math.max(Math.min(requiredUnitsRaw, maxUnits), 0);
+    if (requiredUnits <= 0) {
+      entry.room_unit_ids = [];
+      entry.room_unit_label = '-';
+      return;
+    }
+
+    const availableSlots = [];
+    for (let i = 0; i < maxUnits; i += 1) {
+      if (!slotEnds[i] || String(slotEnds[i]) <= String(entry.check_in)) {
+        availableSlots.push(i + 1);
+      }
+    }
+
+    const assigned = availableSlots.slice(0, requiredUnits);
+
+    assigned.forEach((slotId) => {
+      slotEnds[slotId - 1] = entry.check_out;
+    });
+    entry.room_unit_ids = assigned;
+    entry.room_unit_label =
+      assigned.length === requiredUnits
+        ? assigned.join(', ')
+        : `${assigned.join(', ') || '-'} (overbooked)`;
+  });
+}
+
+function getScopedRoomById(db, user, roomId) {
+  const room = db
+    .prepare('SELECT id, name, quantity, hotel_id FROM rooms WHERE id = ?')
+    .get(roomId);
+  if (!room) {
+    return null;
+  }
+  if (user.role === 'hotel-admin' && Number(user.hotelId || 0) !== Number(room.hotel_id || 0)) {
+    return null;
+  }
+  return room;
+}
+
+function getScopedTentById(db, user, tentId) {
+  const tent = db
+    .prepare('SELECT id, name, quantity, hotel_id FROM tents WHERE id = ?')
+    .get(tentId);
+  if (!tent) {
+    return null;
+  }
+  if (user.role === 'hotel-admin' && Number(user.hotelId || 0) !== Number(tent.hotel_id || 0)) {
+    return null;
+  }
+  return tent;
+}
+
 function getBookingHotelId(db, booking) {
   if (!booking || !booking.property_type || !booking.property_id) {
     return null;
@@ -546,55 +613,85 @@ async function listInventory(req, res) {
     const status = req.query.status ? String(req.query.status).trim() : '';
     const search = req.query.search ? String(req.query.search).trim() : '';
 
-    let query = `SELECT r.id,
-                        r.name,
-                        r.type,
-                        r.status,
-                        r.capacity,
-                        r.quantity,
-                        r.registrationAmount,
-                        r.arrivalAmount,
-                        r.totalPrice,
-                        r.hotel_id,
-                        h.name as hotel_name
-                 FROM rooms r
-                 LEFT JOIN hotels h ON h.id = r.hotel_id
-                 WHERE 1 = 1`;
     const params = [];
-
+    const filterConditions = [];
     if (selectedHotelId) {
-      query += ' AND r.hotel_id = ?';
+      filterConditions.push('p.hotel_id = ?');
       params.push(selectedHotelId);
     }
     if (type) {
-      query += ' AND r.type = ?';
+      filterConditions.push('p.type = ?');
       params.push(type);
     }
     if (status) {
-      query += ' AND r.status = ?';
+      filterConditions.push('p.status = ?');
       params.push(status);
     }
     if (search) {
-      query += ' AND (r.name LIKE ? OR r.type LIKE ? OR h.name LIKE ?)';
+      filterConditions.push('(p.name LIKE ? OR p.type LIKE ? OR h.name LIKE ?)');
       const like = `%${search}%`;
       params.push(like, like, like);
     }
 
-    query += " ORDER BY COALESCE(h.name, 'Unassigned'), r.name";
-    const rooms = db.prepare(query).all(...params);
+    const whereClause = filterConditions.length ? ` AND ${filterConditions.join(' AND ')}` : '';
+    const propertiesQuery = `
+      SELECT p.property_type,
+             p.id,
+             p.name,
+             p.type,
+             p.status,
+             p.capacity,
+             p.quantity,
+             p.registrationAmount,
+             p.arrivalAmount,
+             p.totalPrice,
+             p.hotel_id,
+             h.name as hotel_name
+      FROM (
+        SELECT 'room' as property_type, r.*
+        FROM rooms r
+        UNION ALL
+        SELECT 'tent' as property_type, t.*
+        FROM tents t
+      ) p
+      LEFT JOIN hotels h ON h.id = p.hotel_id
+      WHERE 1 = 1
+      ${whereClause}
+      ORDER BY COALESCE(h.name, 'Unassigned'), p.property_type, p.name`;
+    const properties = db.prepare(propertiesQuery).all(...params);
 
-    const overlapStmt = db.prepare(
+    const bookingOverlapStmt = db.prepare(
       `SELECT COUNT(*) as c
        FROM bookings
-       WHERE property_type = 'room'
+       WHERE property_type = ?
          AND property_id = ?
          AND status != 'cancelled'
          AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
     );
+    const roomManualOverlapStmt = db.prepare(
+      `SELECT IFNULL(SUM(booked_quantity), 0) as c
+       FROM room_manual_bookings
+       WHERE room_id = ?
+         AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+    );
+    const tentManualOverlapStmt = db.prepare(
+      `SELECT IFNULL(SUM(booked_quantity), 0) as c
+       FROM tent_manual_bookings
+       WHERE tent_id = ?
+         AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+    );
 
-    const rows = rooms.map((room) => {
-      const registeredQuantity = Math.max(Number(room.quantity || 1), 1);
-      const rawBookedQuantity = Number(overlapStmt.get(room.id, requestedFrom, requestedTo).c || 0);
+    const rows = properties.map((property) => {
+      const registeredQuantity = Math.max(Number(property.quantity || 1), 1);
+      const actualBookedQuantity = Number(
+        bookingOverlapStmt.get(property.property_type, property.id, requestedFrom, requestedTo).c || 0
+      );
+      const manualBookedQuantity = Number(
+        property.property_type === 'room'
+          ? roomManualOverlapStmt.get(property.id, requestedFrom, requestedTo).c || 0
+          : tentManualOverlapStmt.get(property.id, requestedFrom, requestedTo).c || 0
+      );
+      const rawBookedQuantity = actualBookedQuantity + manualBookedQuantity;
       const bookedQuantity = Math.min(rawBookedQuantity, registeredQuantity);
       const availableQuantity = Math.max(registeredQuantity - bookedQuantity, 0);
       const occupancyPercent = registeredQuantity
@@ -602,20 +699,24 @@ async function listInventory(req, res) {
         : 0;
 
       return {
-        room_id: room.id,
-        room_name: room.name,
-        room_type: room.type,
-        room_status: room.status,
-        capacity: Number(room.capacity || 0),
-        hotel_id: room.hotel_id,
-        hotel_name: room.hotel_name || 'Unassigned',
+        property_type: property.property_type,
+        property_id: property.id,
+        property_name: property.name,
+        property_item_label: `${property.property_type === 'room' ? 'Room' : 'Tent'} #${property.id}`,
+        property_type_name: property.type,
+        property_status: property.status,
+        capacity: Number(property.capacity || 0),
+        hotel_id: property.hotel_id,
+        hotel_name: property.hotel_name || 'Unassigned',
         registered_quantity: registeredQuantity,
+        actual_booked_quantity: actualBookedQuantity,
+        manual_booked_quantity: manualBookedQuantity,
         booked_quantity: bookedQuantity,
         available_quantity: availableQuantity,
         occupancy_percent: occupancyPercent,
-        registration_amount: Number(room.registrationAmount || 0),
-        arrival_amount: Number(room.arrivalAmount || 0),
-        total_price: Number(room.totalPrice || 0)
+        registration_amount: Number(property.registrationAmount || 0),
+        arrival_amount: Number(property.arrivalAmount || 0),
+        total_price: Number(property.totalPrice || 0)
       };
     });
 
@@ -626,7 +727,7 @@ async function listInventory(req, res) {
         hotelSummaryMap.set(key, {
           hotel_id: row.hotel_id,
           hotel_name: row.hotel_name,
-          room_types: 0,
+          property_types: 0,
           registered_quantity: 0,
           booked_quantity: 0,
           available_quantity: 0,
@@ -634,7 +735,7 @@ async function listInventory(req, res) {
         });
       }
       const bucket = hotelSummaryMap.get(key);
-      bucket.room_types += 1;
+      bucket.property_types += 1;
       bucket.registered_quantity += row.registered_quantity;
       bucket.booked_quantity += row.booked_quantity;
       bucket.available_quantity += row.available_quantity;
@@ -658,7 +759,7 @@ async function listInventory(req, res) {
         to: requestedTo
       },
       summary: {
-        room_types: rows.length,
+        property_types: rows.length,
         hotels: hotelSummary.length,
         registered_quantity: totalRegistered,
         booked_quantity: totalBooked,
@@ -670,6 +771,283 @@ async function listInventory(req, res) {
     });
   } catch (err) {
     console.error('Admin inventory error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+}
+
+async function createManualRoomBooking(req, res) {
+  try {
+    const { propertyType, propertyId, roomId, tentId, from, to, bookedQuantity, notes } = req.body || {};
+    const normalizedType = propertyType === 'tent' || tentId ? 'tent' : 'room';
+    const parsedPropertyId = Number(propertyId || roomId || tentId);
+    const parsedBookedQuantity = Number(bookedQuantity);
+
+    if (!['room', 'tent'].includes(normalizedType)) {
+      return res.status(400).json({ message: 'propertyType must be room or tent' });
+    }
+    if (!Number.isInteger(parsedPropertyId) || parsedPropertyId <= 0) {
+      return res.status(400).json({ message: 'Valid propertyId is required' });
+    }
+    if (!isValidDateString(from) || !isValidDateString(to) || String(to) <= String(from)) {
+      return res.status(400).json({ message: 'Valid date range is required and `to` must be after `from`' });
+    }
+    if (!Number.isInteger(parsedBookedQuantity) || parsedBookedQuantity < 0) {
+      return res.status(400).json({ message: 'bookedQuantity must be a whole number (0 or more)' });
+    }
+
+    const db = getDb();
+    const property =
+      normalizedType === 'room'
+        ? getScopedRoomById(db, req.user, parsedPropertyId)
+        : getScopedTentById(db, req.user, parsedPropertyId);
+    if (!property) {
+      return res.status(404).json({ message: 'Property not found or access denied' });
+    }
+
+    const propertyQuantity = Math.max(Number(property.quantity || 1), 1);
+    if (parsedBookedQuantity > propertyQuantity) {
+      return res
+        .status(400)
+        .json({ message: `bookedQuantity cannot exceed property quantity (${propertyQuantity})` });
+    }
+
+    const tableName = normalizedType === 'room' ? 'room_manual_bookings' : 'tent_manual_bookings';
+    const idColumn = normalizedType === 'room' ? 'room_id' : 'tent_id';
+
+    if (parsedBookedQuantity === 0) {
+      db.prepare(
+        `DELETE FROM ${tableName}
+         WHERE ${idColumn} = ? AND check_in = ? AND check_out = ?`
+      ).run(parsedPropertyId, from, to);
+      return res.json({
+        success: true,
+        removed: true,
+        property_type: normalizedType,
+        property_id: parsedPropertyId,
+        check_in: from,
+        check_out: to
+      });
+    }
+
+    const normalizedNotes = typeof notes === 'string' ? notes.trim().slice(0, 500) : null;
+    db.prepare(
+      `INSERT INTO ${tableName} (${idColumn}, check_in, check_out, booked_quantity, notes, created_by_user_id)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(${idColumn}, check_in, check_out)
+       DO UPDATE SET
+         booked_quantity = excluded.booked_quantity,
+         notes = excluded.notes,
+         created_by_user_id = excluded.created_by_user_id`
+    ).run(parsedPropertyId, from, to, parsedBookedQuantity, normalizedNotes || null, req.user.id);
+
+    const saved = db
+      .prepare(
+        `SELECT id, ${idColumn} as property_id, check_in, check_out, booked_quantity, notes, created_by_user_id, created_at
+         FROM ${tableName}
+         WHERE ${idColumn} = ? AND check_in = ? AND check_out = ?`
+      )
+      .get(parsedPropertyId, from, to);
+
+    return res.status(201).json({ property_type: normalizedType, ...saved });
+  } catch (err) {
+    console.error('Create manual room booking error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+}
+
+async function deleteManualRoomBooking(req, res) {
+  try {
+    const manualBookingId = Number(req.params.id);
+    const propertyType = String(req.query.propertyType || 'room').trim().toLowerCase();
+    if (!Number.isInteger(manualBookingId) || manualBookingId <= 0) {
+      return res.status(400).json({ message: 'Valid manual booking id is required' });
+    }
+    if (!['room', 'tent'].includes(propertyType)) {
+      return res.status(400).json({ message: 'propertyType must be room or tent' });
+    }
+
+    const db = getDb();
+    const tableName = propertyType === 'room' ? 'room_manual_bookings' : 'tent_manual_bookings';
+    const idColumn = propertyType === 'room' ? 'room_id' : 'tent_id';
+    const existing = db
+      .prepare(
+        `SELECT mb.id, mb.${idColumn} as property_id, mb.check_in, mb.check_out, mb.booked_quantity, h.id as hotel_id
+         FROM ${tableName} mb
+         LEFT JOIN ${propertyType === 'room' ? 'rooms' : 'tents'} p ON p.id = mb.${idColumn}
+         LEFT JOIN hotels h ON h.id = p.hotel_id
+         WHERE mb.id = ?`
+      )
+      .get(manualBookingId);
+    if (!existing) {
+      return res.status(404).json({ message: 'Manual booking not found' });
+    }
+
+    if (req.user.role === 'hotel-admin') {
+      if (!req.user.hotelId || Number(existing.hotel_id || 0) !== Number(req.user.hotelId)) {
+        return res.status(403).json({ message: 'Not allowed to cancel manual bookings of another hotel' });
+      }
+    }
+
+    db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(manualBookingId);
+    return res.json({ success: true, removed: true, id: manualBookingId, property_type: propertyType });
+  } catch (err) {
+    console.error('Delete manual room booking error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+}
+
+function listPropertyBookingsData(db, propertyType, propertyId) {
+  const propertyTable = propertyType === 'room' ? 'rooms' : 'tents';
+  const manualTable = propertyType === 'room' ? 'room_manual_bookings' : 'tent_manual_bookings';
+  const manualPropertyIdColumn = propertyType === 'room' ? 'room_id' : 'tent_id';
+
+  const property = db
+    .prepare(
+      `SELECT p.id, p.name, p.type, p.quantity, p.hotel_id, COALESCE(h.name, 'Unassigned') as hotel_name
+       FROM ${propertyTable} p
+       LEFT JOIN hotels h ON h.id = p.hotel_id
+       WHERE p.id = ?`
+    )
+    .get(propertyId);
+  if (!property) {
+    return null;
+  }
+
+  const bookingRows = db
+    .prepare(
+      `SELECT b.id,
+              b.booking_ref,
+              b.check_in,
+              b.check_out,
+              b.status,
+              b.payment_status,
+              b.registration_amount,
+              b.arrival_amount,
+              b.total_amount,
+              b.created_at,
+              u.name as guest_name,
+              u.phone as guest_phone
+       FROM bookings b
+       LEFT JOIN users u ON u.id = b.user_id
+       WHERE b.property_type = ?
+         AND b.property_id = ?
+       ORDER BY date(b.check_in) DESC, b.id DESC`
+    )
+    .all(propertyType, propertyId);
+
+  const manualRows = db
+    .prepare(
+      `SELECT mb.id,
+              mb.check_in,
+              mb.check_out,
+              mb.booked_quantity,
+              mb.created_at
+       FROM ${manualTable} mb
+       WHERE mb.${manualPropertyIdColumn} = ?
+       ORDER BY date(mb.check_in) DESC, mb.id DESC`
+    )
+    .all(propertyId)
+    .map((manual) => ({
+      id: -Number(manual.id),
+      manual_booking_id: Number(manual.id),
+      source_type: 'manual',
+      booking_ref: `MANUAL-${manual.id}`,
+      check_in: manual.check_in,
+      check_out: manual.check_out,
+      status: 'manual',
+      payment_status: null,
+      registration_amount: 0,
+      arrival_amount: 0,
+      total_amount: 0,
+      created_at: manual.created_at,
+      guest_name: 'SELF',
+      guest_phone: null,
+      manual_booked_quantity: Number(manual.booked_quantity || 0)
+    }));
+
+  const rows = [
+    ...bookingRows.map((booking) => ({
+      ...booking,
+      source_type: 'booking',
+      manual_booking_id: null,
+      manual_booked_quantity: 0
+    })),
+    ...manualRows
+  ];
+  assignRoomUnitLabels(rows, property.quantity);
+
+  const today = getTodayDateString();
+  const currentAndUpcoming = [];
+  const past = [];
+  rows.forEach((booking) => {
+    if (String(booking.check_out) > today) {
+      currentAndUpcoming.push(booking);
+    } else {
+      past.push(booking);
+    }
+  });
+  currentAndUpcoming.sort((a, b) => String(a.check_in).localeCompare(String(b.check_in)));
+  past.sort((a, b) => String(b.check_in).localeCompare(String(a.check_in)));
+
+  return {
+    property: {
+      id: property.id,
+      name: property.name,
+      type: property.type,
+      quantity: Number(property.quantity || 1),
+      hotel_id: property.hotel_id,
+      hotel_name: property.hotel_name,
+      property_type: propertyType
+    },
+    currentAndUpcoming,
+    past
+  };
+}
+
+async function listRoomBookings(req, res) {
+  try {
+    const roomId = Number(req.params.roomId);
+    if (!Number.isInteger(roomId) || roomId <= 0) {
+      return res.status(400).json({ message: 'Valid roomId is required' });
+    }
+
+    const db = getDb();
+    const room = getScopedRoomById(db, req.user, roomId);
+    if (!room) {
+      return res.status(404).json({ message: 'Room not found' });
+    }
+    if (req.user.role === 'hotel-admin' && (!req.user.hotelId || Number(room.hotel_id || 0) !== Number(req.user.hotelId))) {
+      return res.status(403).json({ message: 'Not allowed to view bookings of another hotel room' });
+    }
+
+    const payload = listPropertyBookingsData(db, 'room', roomId);
+    return res.json(payload);
+  } catch (err) {
+    console.error('Admin list room bookings error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+}
+
+async function listTentBookings(req, res) {
+  try {
+    const tentId = Number(req.params.tentId);
+    if (!Number.isInteger(tentId) || tentId <= 0) {
+      return res.status(400).json({ message: 'Valid tentId is required' });
+    }
+
+    const db = getDb();
+    const tent = getScopedTentById(db, req.user, tentId);
+    if (!tent) {
+      return res.status(404).json({ message: 'Tent not found' });
+    }
+    if (req.user.role === 'hotel-admin' && (!req.user.hotelId || Number(tent.hotel_id || 0) !== Number(req.user.hotelId))) {
+      return res.status(403).json({ message: 'Not allowed to view bookings of another hotel tent' });
+    }
+
+    const payload = listPropertyBookingsData(db, 'tent', tentId);
+    return res.json(payload);
+  } catch (err) {
+    console.error('Admin list tent bookings error', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 }
@@ -987,6 +1365,7 @@ async function createTent(req, res) {
       type,
       description,
       capacity,
+      quantity,
       registrationAmount,
       arrivalAmount,
       amenities,
@@ -1006,6 +1385,10 @@ async function createTent(req, res) {
         .status(400)
         .json({ message: 'downpaymentAmount and arrivalAmount must be greater than 0' });
     }
+    const tentQuantity = quantity != null ? Number(quantity) : 1;
+    if (!Number.isInteger(tentQuantity) || tentQuantity <= 0) {
+      return res.status(400).json({ message: 'quantity must be a positive whole number' });
+    }
     const db = getDb();
     const totalPrice = registration + arrival;
 
@@ -1024,17 +1407,18 @@ async function createTent(req, res) {
 
     const stmt = db.prepare(
       `INSERT INTO tents (
-        name, type, description, capacity,
+        name, type, description, capacity, quantity,
         basePrice, registrationAmount, arrivalAmount, totalPrice,
         amenities, status, hotel_id
       )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const info = stmt.run(
       name,
       type,
       description || null,
       capacity || 2,
+      tentQuantity,
       totalPrice,
       registration,
       arrival,
@@ -1054,7 +1438,7 @@ async function createTent(req, res) {
 async function updateTent(req, res) {
   try {
     const id = Number(req.params.id);
-    const { name, type, description, capacity, registrationAmount, arrivalAmount, amenities, status } = req.body;
+    const { name, type, description, capacity, quantity, registrationAmount, arrivalAmount, amenities, status } = req.body;
     const db = getDb();
     const existing = db.prepare('SELECT * FROM tents WHERE id = ?').get(id);
     if (!existing) {
@@ -1080,11 +1464,15 @@ async function updateTent(req, res) {
         .status(400)
         .json({ message: 'downpaymentAmount and arrivalAmount must be greater than 0' });
     }
+    const nextQuantity = quantity != null ? Number(quantity) : Number(existing.quantity || 1);
+    if (!Number.isInteger(nextQuantity) || nextQuantity <= 0) {
+      return res.status(400).json({ message: 'quantity must be a positive whole number' });
+    }
     const nextTotal = nextRegistration + nextArrival;
 
     const stmt = db.prepare(
       `UPDATE tents SET 
-        name = ?, type = ?, description = ?, capacity = ?, 
+        name = ?, type = ?, description = ?, capacity = ?, quantity = ?,
         basePrice = ?, registrationAmount = ?, arrivalAmount = ?, totalPrice = ?, amenities = ?, status = ?
        WHERE id = ?`
     );
@@ -1093,6 +1481,7 @@ async function updateTent(req, res) {
       type ?? existing.type,
       description ?? existing.description,
       capacity ?? existing.capacity,
+      nextQuantity,
       nextTotal,
       nextRegistration,
       nextArrival,
@@ -1358,6 +1747,9 @@ async function updateBookingStatus(req, res) {
       if (!req.user.hotelId || Number(bookingHotelId) !== Number(req.user.hotelId)) {
         return res.status(403).json({ message: 'Not allowed to modify bookings of another hotel' });
       }
+      if (status !== 'cancelled') {
+        return res.status(403).json({ message: 'Hotel admin can only cancel bookings' });
+      }
     }
     db.prepare('UPDATE bookings SET status = ? WHERE id = ?').run(status, id);
     const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
@@ -1599,6 +1991,10 @@ module.exports = {
   getDashboard,
   listRooms,
   listInventory,
+  listRoomBookings,
+  listTentBookings,
+  createManualRoomBooking,
+  deleteManualRoomBooking,
   createRoom,
   updateRoom,
   deleteRoom,

@@ -62,7 +62,7 @@ function hasInventoryForDates(db, propertyType, propertyId, checkIn, checkOut) {
       return false;
     }
     const totalInventory = Math.max(Number(room.quantity || 1), 1);
-    const overlappingCount = db
+    const overlappingBookingsCount = db
       .prepare(
         `SELECT COUNT(*) as c FROM bookings
          WHERE property_type = 'room'
@@ -71,7 +71,41 @@ function hasInventoryForDates(db, propertyType, propertyId, checkIn, checkOut) {
            AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
       )
       .get(propertyId, checkIn, checkOut).c;
-    return overlappingCount < totalInventory;
+    const overlappingManualCount = db
+      .prepare(
+        `SELECT IFNULL(SUM(booked_quantity), 0) as c
+         FROM room_manual_bookings
+         WHERE room_id = ?
+           AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+      )
+      .get(propertyId, checkIn, checkOut).c;
+    return Number(overlappingBookingsCount || 0) + Number(overlappingManualCount || 0) < totalInventory;
+  }
+
+  if (propertyType === 'tent') {
+    const tent = db.prepare('SELECT quantity FROM tents WHERE id = ?').get(propertyId);
+    if (!tent) {
+      return false;
+    }
+    const totalInventory = Math.max(Number(tent.quantity || 1), 1);
+    const overlappingBookingsCount = db
+      .prepare(
+        `SELECT COUNT(*) as c FROM bookings
+         WHERE property_type = 'tent'
+           AND property_id = ?
+           AND status != 'cancelled'
+           AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+      )
+      .get(propertyId, checkIn, checkOut).c;
+    const overlappingManualCount = db
+      .prepare(
+        `SELECT IFNULL(SUM(booked_quantity), 0) as c
+         FROM tent_manual_bookings
+         WHERE tent_id = ?
+           AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+      )
+      .get(propertyId, checkIn, checkOut).c;
+    return Number(overlappingBookingsCount || 0) + Number(overlappingManualCount || 0) < totalInventory;
   }
 
   const overlapping = db

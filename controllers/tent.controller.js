@@ -33,6 +33,60 @@ function parseAmenities(rawAmenities) {
   return [String(rawAmenities)];
 }
 
+function getFullyBookedRanges(bookings, manualBookings, quantity) {
+  const totalInventory = Math.max(Number(quantity || 1), 1);
+  const hasBookingData = Array.isArray(bookings) && bookings.length;
+  const hasManualData = Array.isArray(manualBookings) && manualBookings.length;
+  if (!hasBookingData && !hasManualData) {
+    return [];
+  }
+
+  const deltasByDate = new Map();
+  (bookings || []).forEach((booking) => {
+    if (!booking?.check_in || !booking?.check_out || booking.check_out <= booking.check_in) {
+      return;
+    }
+    deltasByDate.set(booking.check_in, (deltasByDate.get(booking.check_in) || 0) + 1);
+    deltasByDate.set(booking.check_out, (deltasByDate.get(booking.check_out) || 0) - 1);
+  });
+  (manualBookings || []).forEach((booking) => {
+    const quantityDelta = Number(booking?.booked_quantity || 0);
+    if (
+      !booking?.check_in ||
+      !booking?.check_out ||
+      booking.check_out <= booking.check_in ||
+      quantityDelta <= 0
+    ) {
+      return;
+    }
+    deltasByDate.set(booking.check_in, (deltasByDate.get(booking.check_in) || 0) + quantityDelta);
+    deltasByDate.set(booking.check_out, (deltasByDate.get(booking.check_out) || 0) - quantityDelta);
+  });
+
+  const dates = Array.from(deltasByDate.keys()).sort((a, b) => a.localeCompare(b));
+  const ranges = [];
+  let active = 0;
+
+  for (let i = 0; i < dates.length - 1; i += 1) {
+    const currentDate = dates[i];
+    const nextDate = dates[i + 1];
+    active += deltasByDate.get(currentDate) || 0;
+
+    if (currentDate >= nextDate || active < totalInventory) {
+      continue;
+    }
+
+    const lastRange = ranges.length ? ranges[ranges.length - 1] : null;
+    if (lastRange && lastRange.checkOut === currentDate) {
+      lastRange.checkOut = nextDate;
+    } else {
+      ranges.push({ checkIn: currentDate, checkOut: nextDate, status: 'full' });
+    }
+  }
+
+  return ranges;
+}
+
 async function listTents(req, res) {
   try {
     const { type, minPrice, maxPrice, capacity } = req.query;
@@ -117,16 +171,25 @@ async function searchTents(req, res) {
     const tents = db.prepare(query).all(...params);
 
     const availableTents = tents.filter((tent) => {
-      const overlapping = db
+      const overlappingBookingsCount = db
         .prepare(
-          `SELECT 1 FROM bookings 
+          `SELECT COUNT(*) as c FROM bookings 
            WHERE property_type = 'tent'
              AND property_id = ?
              AND status != 'cancelled'
              AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
         )
-        .get(tent.id, checkin, checkout);
-      return !overlapping;
+        .get(tent.id, checkin, checkout).c;
+      const overlappingManualCount = db
+        .prepare(
+          `SELECT IFNULL(SUM(booked_quantity), 0) as c
+           FROM tent_manual_bookings
+           WHERE tent_id = ?
+             AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+        )
+        .get(tent.id, checkin, checkout).c;
+      const totalInventory = Math.max(Number(tent.quantity || 1), 1);
+      return Number(overlappingBookingsCount || 0) + Number(overlappingManualCount || 0) < totalInventory;
     });
 
     const tentIds = availableTents.map((t) => t.id);
@@ -190,7 +253,7 @@ async function getTentById(req, res) {
         url: buildImageUrl(req, path.join('uploads', 'tents', path.basename(img.image_path)))
       }));
 
-    const bookedDateRanges = db
+    const activeBookings = db
       .prepare(
         `SELECT check_in, check_out, status
          FROM bookings
@@ -200,12 +263,18 @@ async function getTentById(req, res) {
            AND date(check_out) >= date('now')
          ORDER BY date(check_in) ASC`
       )
-      .all(id)
-      .map((row) => ({
-        checkIn: row.check_in,
-        checkOut: row.check_out,
-        status: row.status
-      }));
+      .all(id);
+    const activeManualBookings = db
+      .prepare(
+        `SELECT check_in, check_out, booked_quantity
+         FROM tent_manual_bookings
+         WHERE tent_id = ?
+           AND booked_quantity > 0
+           AND date(check_out) >= date('now')
+         ORDER BY date(check_in) ASC`
+      )
+      .all(id);
+    const bookedDateRanges = getFullyBookedRanges(activeBookings, activeManualBookings, tent.quantity);
 
     return res.json({
       ...tent,

@@ -40,6 +40,10 @@ router.delete('/users/:id', requireAdmin, adminController.deleteUser);
 // Rooms (admin + hotel-admin, hotel scoped in controller)
 router.get('/rooms', requireAdminOrHotelAdmin, adminController.listRooms);
 router.get('/inventory', requireAdminOrHotelAdmin, adminController.listInventory);
+router.get('/inventory/rooms/:roomId/bookings', requireAdminOrHotelAdmin, adminController.listRoomBookings);
+router.get('/inventory/tents/:tentId/bookings', requireAdminOrHotelAdmin, adminController.listTentBookings);
+router.post('/inventory/manual-bookings', requireAdminOrHotelAdmin, adminController.createManualRoomBooking);
+router.delete('/inventory/manual-bookings/:id', requireAdminOrHotelAdmin, adminController.deleteManualRoomBooking);
 router.post('/rooms', requireAdminOrHotelAdmin, adminController.createRoom);
 router.put('/rooms/:id', requireAdminOrHotelAdmin, adminController.updateRoom);
 router.delete('/rooms/:id', requireAdminOrHotelAdmin, adminController.deleteRoom);
@@ -58,7 +62,7 @@ router.put('/tents/:id/images/:imageId/primary', requireAdminOrHotelAdmin, admin
 
 // Other admin-only sections
 router.get('/bookings', requireAdminOrHotelAdmin, adminController.listAdminBookings);
-router.put('/bookings/:id/status', requireAdmin, adminController.updateBookingStatus);
+router.put('/bookings/:id/status', requireAdminOrHotelAdmin, adminController.updateBookingStatus);
 router.put('/bookings/:id/approve-payment', requireAdmin, adminController.approveBookingPayment);
 
 router.get('/price-settings', requireAdmin, adminController.listPriceSettings);

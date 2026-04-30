@@ -33,19 +33,34 @@ function parseAmenities(rawAmenities) {
   return [String(rawAmenities)];
 }
 
-function getFullyBookedRanges(bookings, quantity) {
+function getFullyBookedRanges(bookings, manualBookings, quantity) {
   const totalInventory = Math.max(Number(quantity || 1), 1);
-  if (!Array.isArray(bookings) || !bookings.length) {
+  const hasBookingData = Array.isArray(bookings) && bookings.length;
+  const hasManualData = Array.isArray(manualBookings) && manualBookings.length;
+  if (!hasBookingData && !hasManualData) {
     return [];
   }
 
   const deltasByDate = new Map();
-  bookings.forEach((booking) => {
+  (bookings || []).forEach((booking) => {
     if (!booking?.check_in || !booking?.check_out || booking.check_out <= booking.check_in) {
       return;
     }
     deltasByDate.set(booking.check_in, (deltasByDate.get(booking.check_in) || 0) + 1);
     deltasByDate.set(booking.check_out, (deltasByDate.get(booking.check_out) || 0) - 1);
+  });
+  (manualBookings || []).forEach((booking) => {
+    const quantityDelta = Number(booking?.booked_quantity || 0);
+    if (
+      !booking?.check_in ||
+      !booking?.check_out ||
+      booking.check_out <= booking.check_in ||
+      quantityDelta <= 0
+    ) {
+      return;
+    }
+    deltasByDate.set(booking.check_in, (deltasByDate.get(booking.check_in) || 0) + quantityDelta);
+    deltasByDate.set(booking.check_out, (deltasByDate.get(booking.check_out) || 0) - quantityDelta);
   });
 
   const dates = Array.from(deltasByDate.keys()).sort((a, b) => a.localeCompare(b));
@@ -156,7 +171,7 @@ async function searchRooms(req, res) {
     const rooms = db.prepare(query).all(...params);
 
     const availableRooms = rooms.filter((room) => {
-      const overlappingCount = db
+      const overlappingBookingsCount = db
         .prepare(
           `SELECT COUNT(*) as c FROM bookings 
            WHERE property_type = 'room'
@@ -165,8 +180,16 @@ async function searchRooms(req, res) {
              AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
         )
         .get(room.id, checkin, checkout).c;
+      const overlappingManualCount = db
+        .prepare(
+          `SELECT IFNULL(SUM(booked_quantity), 0) as c
+           FROM room_manual_bookings
+           WHERE room_id = ?
+             AND NOT (date(check_out) <= date(?) OR date(check_in) >= date(?))`
+        )
+        .get(room.id, checkin, checkout).c;
       const totalInventory = Math.max(Number(room.quantity || 1), 1);
-      return overlappingCount < totalInventory;
+      return Number(overlappingBookingsCount || 0) + Number(overlappingManualCount || 0) < totalInventory;
     });
 
     const roomIds = availableRooms.map((r) => r.id);
@@ -241,7 +264,17 @@ async function getRoomById(req, res) {
          ORDER BY date(check_in) ASC`
       )
       .all(id);
-    const bookedDateRanges = getFullyBookedRanges(activeBookings, room.quantity);
+    const activeManualBookings = db
+      .prepare(
+        `SELECT check_in, check_out, booked_quantity
+         FROM room_manual_bookings
+         WHERE room_id = ?
+           AND booked_quantity > 0
+           AND date(check_out) >= date('now')
+         ORDER BY date(check_in) ASC`
+      )
+      .all(id);
+    const bookedDateRanges = getFullyBookedRanges(activeBookings, activeManualBookings, room.quantity);
 
     return res.json({
       ...room,
